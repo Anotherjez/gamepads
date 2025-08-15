@@ -11,11 +11,16 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <chrono>
 
 #include "gamepad.h"
 #include "utils.h"
 
 Gamepads gamepads;
+
+// Polling interval to reduce CPU usage while reading gamepad state.
+// 8 ms aligns with ~125 Hz update rate typical for many controllers.
+static constexpr int kPollIntervalMs = 8;
 
 std::list<Event> Gamepads::diff_states(Gamepad* gamepad,
                                        const JOYINFOEX& old,
@@ -78,6 +83,16 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
   int joy_id = gamepad->joy_id;
 
   std::cout << "Listening to gamepad " << joy_id << std::endl;
+  // Lower thread priority to minimize CPU impact under load.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  // Initial read to seed the state and avoid spurious diffs on first loop.
+  MMRESULT init_result = joyGetPosEx(joy_id, &state);
+  if (init_result != JOYERR_NOERROR) {
+    std::cout << "Fail to initialize gamepad " << joy_id << std::endl;
+    gamepad->alive = false;
+    gamepads.erase(joy_id);
+    return;
+  }
 
   while (gamepad->alive) {
     JOYINFOEX previous_state = state;
@@ -95,7 +110,11 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
       std::cout << "Fail to listen to gamepad " << joy_id << std::endl;
       gamepad->alive = false;
       gamepads.erase(joy_id);
+      break;
     }
+
+    // Throttle polling to reduce CPU usage.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
   }
 }
 
@@ -115,12 +134,12 @@ void Gamepads::update_gamepads() {
     if (result == JOYERR_NOERROR) {
       std::string name = to_string(joy_caps.szPname);
       int num_buttons = static_cast<int>(joy_caps.wNumButtons);
-      std::optional<Gamepad> gamepad = gamepads[joy_id];
-      if (gamepad) {
-        if (gamepad->name != name) {
+      auto it = gamepads.find(joy_id);
+      if (it != gamepads.end()) {
+        if (it->second.name != name) {
           std::cout << "Updated gamepad " << joy_id << std::endl;
-          gamepad->alive = false;
-          gamepads.erase(joy_id);
+          it->second.alive = false;
+          gamepads.erase(it);
 
           connect_gamepad(joy_id, name, num_buttons);
         }
