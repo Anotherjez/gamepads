@@ -6,8 +6,6 @@
 
 #include <memory>
 
-#include <flutter/task_runner.h>
-
 #include "gamepad.h"
 
 namespace gamepads_windows {
