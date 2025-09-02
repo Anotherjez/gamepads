@@ -6,6 +6,8 @@
 
 #include <memory>
 
+#include <flutter/task_runner.h>
+
 #include "gamepad.h"
 
 namespace gamepads_windows {
@@ -29,6 +31,7 @@ class GamepadsWindowsPlugin : public flutter::Plugin {
 
   int window_proc_id = -1;
   HDEVNOTIFY hDevNotify;
+  std::shared_ptr<flutter::TaskRunner> task_runner;
 
   void HandleMethodCall(
       const flutter::MethodCall<flutter::EncodableValue>& method_call,

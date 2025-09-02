@@ -32,6 +32,9 @@ void GamepadsWindowsPlugin::RegisterWithRegistrar(
 GamepadsWindowsPlugin::GamepadsWindowsPlugin(
     flutter::PluginRegistrarWindows* registrar)
     : registrar(registrar) {
+  // Capture the platform task runner to ensure channel calls happen on the
+  // platform thread.
+  task_runner = registrar->task_runner();
   gamepads.event_emitter = [&](Gamepad* gamepad, const Event& event) {
     this->emit_gamepad_event(gamepad, event);
   };
@@ -76,7 +79,30 @@ void GamepadsWindowsPlugin::HandleMethodCall(
 void GamepadsWindowsPlugin::emit_gamepad_event(Gamepad* gamepad,
                                                const Event& event) {
   auto _channel = this->channel.get();
-  if (_channel) {
+  if (!_channel)
+    return;
+  if (task_runner && !task_runner->RunsTasksOnCurrentThread()) {
+    // Marshal to platform thread.
+    auto joy_id = gamepad->joy_id;
+    auto time = event.time;
+    auto type = event.type;
+    auto key = event.key;
+    auto value = event.value;
+    task_runner->PostTask([_channel, joy_id, time, type, key, value]() {
+      flutter::EncodableMap map;
+      map[flutter::EncodableValue("gamepadId")] =
+          flutter::EncodableValue(std::to_string(joy_id));
+      map[flutter::EncodableValue("time")] = flutter::EncodableValue(time);
+      map[flutter::EncodableValue("type")] = flutter::EncodableValue(type);
+      map[flutter::EncodableValue("key")] = flutter::EncodableValue(key);
+      map[flutter::EncodableValue("value")] =
+          flutter::EncodableValue(static_cast<double>(value));
+      _channel->InvokeMethod("onGamepadEvent",
+                             std::make_unique<flutter::EncodableValue>(
+                                 flutter::EncodableValue(map)));
+    });
+  } else {
+    // Already on platform thread.
     flutter::EncodableMap map;
     map[flutter::EncodableValue("gamepadId")] =
         flutter::EncodableValue(std::to_string(gamepad->joy_id));
