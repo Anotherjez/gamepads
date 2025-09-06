@@ -31,18 +31,20 @@ static IDirectInput8W* g_direct_input = nullptr;
 static inline DWORD di_axis_to_joy(LONG v) {
   // DI axes are typically -32768..32767; convert to 0..65535
   long shifted = static_cast<long>(v) + 32768L;
-  if (shifted < 0) shifted = 0;
-  if (shifted > 65535L) shifted = 65535L;
+  if (shifted < 0)
+    shifted = 0;
+  if (shifted > 65535L)
+    shifted = 65535L;
   return static_cast<DWORD>(shifted);
 }
 
-
 static bool EnsureDirectInput() {
-  if (g_direct_input) return true;
+  if (g_direct_input)
+    return true;
   HINSTANCE hInst = GetModuleHandleW(nullptr);
-  HRESULT hr = DirectInput8Create(hInst, DIRECTINPUT_VERSION,
-                                  IID_IDirectInput8W, (void**)&g_direct_input,
-                                  nullptr);
+  HRESULT hr =
+      DirectInput8Create(hInst, DIRECTINPUT_VERSION, IID_IDirectInput8W,
+                         (void**)&g_direct_input, nullptr);
   if (FAILED(hr)) {
     std::cout << "DirectInput8Create failed: 0x" << std::hex << hr << std::dec
               << std::endl;
@@ -63,7 +65,8 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
   auto prod = std::wstring(inst->tszProductName);
   auto instname = std::wstring(inst->tszInstanceName);
   auto tolower_inplace = [](std::wstring& s) {
-    for (auto& ch : s) ch = static_cast<wchar_t>(towlower(ch));
+    for (auto& ch : s)
+      ch = static_cast<wchar_t>(towlower(ch));
   };
   tolower_inplace(target);
   tolower_inplace(prod);
@@ -82,7 +85,8 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
 }
 
 static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
-  if (!EnsureDirectInput()) return nullptr;
+  if (!EnsureDirectInput())
+    return nullptr;
   IDirectInputDevice8W* device = nullptr;
   DiFindContext ctx;
   ctx.target_name = name;
@@ -97,8 +101,8 @@ static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
         [](const DIDEVICEINSTANCEW* inst, VOID* out) -> BOOL {
           auto** dev = reinterpret_cast<IDirectInputDevice8W**>(out);
           if (*dev == nullptr) {
-            if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance,
-                                                       dev, nullptr))) {
+            if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance, dev,
+                                                       nullptr))) {
               return DIENUM_STOP;
             }
           }
@@ -154,9 +158,9 @@ std::list<Event> Gamepads::diff_states(Gamepad* gamepad,
     events.push_back({time, "analog", "pov", static_cast<int>(current.dwPOV)});
   }
   if (old.dwButtons != current.dwButtons) {
-  // Scan up to 32 buttons (JOYINFOEX bitfield limit), independent of
-  // WinMM-reported button count, since DirectInput may have more.
-  for (int i = 0; i < 32; ++i) {
+    // Scan up to 32 buttons (JOYINFOEX bitfield limit), independent of
+    // WinMM-reported button count, since DirectInput may have more.
+    for (int i = 0; i < 32; ++i) {
       bool was_pressed = old.dwButtons & (1 << i);
       bool is_pressed = current.dwButtons & (1 << i);
       if (was_pressed != is_pressed) {
@@ -203,31 +207,38 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
       if (FAILED(hr)) {
         gamepad->di_device->Acquire();
       }
-      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state), &di_state))) {
+      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state),
+                                                       &di_state))) {
         // Seed JOYINFOEX from DIJOYSTATE2 to reuse diff path
-  state.dwXpos = di_axis_to_joy(di_state.lX);
-  state.dwYpos = di_axis_to_joy(di_state.lY);
-  state.dwZpos = di_axis_to_joy(di_state.lZ);
-  state.dwRpos = di_axis_to_joy(di_state.lRz); // wheels often use Rz
-  state.dwUpos = di_axis_to_joy(di_state.lRx);
-  state.dwVpos = di_axis_to_joy(di_state.lRy);
+        state.dwXpos = di_axis_to_joy(di_state.lX);
+        state.dwYpos = di_axis_to_joy(di_state.lY);
+        state.dwZpos = di_axis_to_joy(di_state.lZ);
+        state.dwRpos = di_axis_to_joy(di_state.lRz);  // wheels often use Rz
+        state.dwUpos = di_axis_to_joy(di_state.lRx);
+        state.dwVpos = di_axis_to_joy(di_state.lRy);
         // Buttons
         DWORD buttons = 0;
         for (int i = 0; i < 32; ++i) {
-          if (di_state.rgbButtons[i] & 0x80) buttons |= (1u << i);
+          if (di_state.rgbButtons[i] & 0x80)
+            buttons |= (1u << i);
         }
         state.dwButtons = buttons;
         // Map POV[0] to 4 synthetic buttons (up/right/down/left) in high bits
         // when pressed; keep dwPOV too for analog pov angle if needed.
-        state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+        state.dwPOV =
+            (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
         if (di_state.rgdwPOV[0] != 0xFFFFFFFF) {
-          DWORD angle = di_state.rgdwPOV[0] / 100; // degrees
+          DWORD angle = di_state.rgdwPOV[0] / 100;  // degrees
           auto set_btn = [&](int bit) { state.dwButtons |= (1u << bit); };
           // Use bits 28..31 for POV
-          if (angle == 0 || angle == 315 || angle == 45) set_btn(28);     // up
-          if (angle == 90 || angle == 45 || angle == 135) set_btn(29);    // right
-          if (angle == 180 || angle == 135 || angle == 225) set_btn(30);  // down
-          if (angle == 270 || angle == 225 || angle == 315) set_btn(31);  // left
+          if (angle == 0 || angle == 315 || angle == 45)
+            set_btn(28);  // up
+          if (angle == 90 || angle == 45 || angle == 135)
+            set_btn(29);  // right
+          if (angle == 180 || angle == 135 || angle == 225)
+            set_btn(30);  // down
+          if (angle == 270 || angle == 225 || angle == 315)
+            set_btn(31);  // left
         }
       }
     }
@@ -243,27 +254,34 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
       if (FAILED(gamepad->di_device->Poll())) {
         gamepad->di_device->Acquire();
       }
-      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state), &di_state))) {
+      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state),
+                                                       &di_state))) {
         // Map DI to JOYINFOEX fields
-  state.dwXpos = di_axis_to_joy(di_state.lX);
-  state.dwYpos = di_axis_to_joy(di_state.lY);
-  state.dwZpos = di_axis_to_joy(di_state.lZ);
-  state.dwRpos = di_axis_to_joy(di_state.lRz);
-  state.dwUpos = di_axis_to_joy(di_state.lRx);
-  state.dwVpos = di_axis_to_joy(di_state.lRy);
+        state.dwXpos = di_axis_to_joy(di_state.lX);
+        state.dwYpos = di_axis_to_joy(di_state.lY);
+        state.dwZpos = di_axis_to_joy(di_state.lZ);
+        state.dwRpos = di_axis_to_joy(di_state.lRz);
+        state.dwUpos = di_axis_to_joy(di_state.lRx);
+        state.dwVpos = di_axis_to_joy(di_state.lRy);
         DWORD buttons = 0;
         for (int i = 0; i < 32; ++i) {
-          if (di_state.rgbButtons[i] & 0x80) buttons |= (1u << i);
+          if (di_state.rgbButtons[i] & 0x80)
+            buttons |= (1u << i);
         }
         state.dwButtons = buttons;
-        state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+        state.dwPOV =
+            (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
         if (di_state.rgdwPOV[0] != 0xFFFFFFFF) {
-          DWORD angle = di_state.rgdwPOV[0] / 100; // degrees
+          DWORD angle = di_state.rgdwPOV[0] / 100;  // degrees
           auto set_btn = [&](int bit) { state.dwButtons |= (1u << bit); };
-          if (angle == 0 || angle == 315 || angle == 45) set_btn(28);
-          if (angle == 90 || angle == 45 || angle == 135) set_btn(29);
-          if (angle == 180 || angle == 135 || angle == 225) set_btn(30);
-          if (angle == 270 || angle == 225 || angle == 315) set_btn(31);
+          if (angle == 0 || angle == 315 || angle == 45)
+            set_btn(28);
+          if (angle == 90 || angle == 45 || angle == 135)
+            set_btn(29);
+          if (angle == 180 || angle == 135 || angle == 225)
+            set_btn(30);
+          if (angle == 270 || angle == 225 || angle == 315)
+            set_btn(31);
         }
         ok = true;
       }
@@ -314,8 +332,8 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
     }
     std::cout << "Using DirectInput for device " << joy_id << std::endl;
   } else {
-    std::wcout << L"DirectInput not matched by name; product: "
-               << wname << std::endl;
+    std::wcout << L"DirectInput not matched by name; product: " << wname
+               << std::endl;
   }
   std::thread read_thread(
       [this, joy_id]() { read_gamepad(&gamepads[joy_id]); });
@@ -341,8 +359,8 @@ void Gamepads::update_gamepads() {
           connect_gamepad(joy_id, name, num_buttons);
         }
       } else {
-  std::cout << "New gamepad connected " << joy_id << std::endl;
-  connect_gamepad(joy_id, name, num_buttons);
+        std::cout << "New gamepad connected " << joy_id << std::endl;
+        connect_gamepad(joy_id, name, num_buttons);
       }
     }
   }

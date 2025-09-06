@@ -38,7 +38,8 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
   gamepads.update_gamepads();
   window_proc_id = registrar->RegisterTopLevelWindowProcDelegate(
       [this](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-        if (!window_handle_) window_handle_ = hwnd;
+        if (!window_handle_)
+          window_handle_ = hwnd;
         if (message == kMsgGamepadEvent) {
           auto payload = reinterpret_cast<flutter::EncodableValue*>(lparam);
           if (channel && payload) {
@@ -86,7 +87,8 @@ void GamepadsWindowsPlugin::HandleMethodCall(
 
 void GamepadsWindowsPlugin::emit_gamepad_event(Gamepad* gamepad,
                                                const Event& event) {
-  if (!channel) return;
+  if (!channel)
+    return;
   flutter::EncodableMap map;
   map[flutter::EncodableValue("gamepadId")] =
       flutter::EncodableValue(std::to_string(gamepad->joy_id));

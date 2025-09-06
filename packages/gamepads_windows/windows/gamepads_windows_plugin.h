@@ -29,9 +29,9 @@ class GamepadsWindowsPlugin : public flutter::Plugin {
 
   int window_proc_id = -1;
   HDEVNOTIFY hDevNotify;
-    // Window handle to post custom messages from background threads.
-    HWND window_handle_ = nullptr;
-    static constexpr UINT kMsgGamepadEvent = WM_APP + 1;
+  // Window handle to post custom messages from background threads.
+  HWND window_handle_ = nullptr;
+  static constexpr UINT kMsgGamepadEvent = WM_APP + 1;
 
   void HandleMethodCall(
       const flutter::MethodCall<flutter::EncodableValue>& method_call,
