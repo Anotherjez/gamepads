@@ -12,13 +12,94 @@
 #include <set>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+
+// DirectInput
+#ifndef DIRECTINPUT_VERSION
+#define DIRECTINPUT_VERSION 0x0800
+#endif
+#include <dinput.h>
+#pragma comment(lib, "dinput8.lib")
+#pragma comment(lib, "dxguid.lib")
 
 #include "gamepad.h"
 #include "utils.h"
 
 Gamepads gamepads;
+// -------------------- DirectInput helpers --------------------
+static IDirectInput8W* g_direct_input = nullptr;
+static inline DWORD di_axis_to_joy(LONG v) {
+  // DI axes are typically -32768..32767; convert to 0..65535
+  long shifted = static_cast<long>(v) + 32768L;
+  if (shifted < 0) shifted = 0;
+  if (shifted > 65535L) shifted = 65535L;
+  return static_cast<DWORD>(shifted);
+}
+
+
+static bool EnsureDirectInput() {
+  if (g_direct_input) return true;
+  HINSTANCE hInst = GetModuleHandleW(nullptr);
+  HRESULT hr = DirectInput8Create(hInst, DIRECTINPUT_VERSION,
+                                  IID_IDirectInput8W, (void**)&g_direct_input,
+                                  nullptr);
+  if (FAILED(hr)) {
+    std::cout << "DirectInput8Create failed: 0x" << std::hex << hr << std::dec
+              << std::endl;
+    return false;
+  }
+  return true;
+}
+
+struct DiFindContext {
+  std::wstring target_name;
+  IDirectInputDevice8W** out_device;
+};
+
+static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
+                                               VOID* ctx) {
+  auto* context = reinterpret_cast<DiFindContext*>(ctx);
+  if (context->target_name == inst->tszProductName) {
+    IDirectInputDevice8W* device = nullptr;
+    if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance, &device,
+                                               nullptr))) {
+      *context->out_device = device;
+      return DIENUM_STOP;
+    }
+  }
+  return DIENUM_CONTINUE;
+}
+
+static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
+  if (!EnsureDirectInput()) return nullptr;
+  IDirectInputDevice8W* device = nullptr;
+  DiFindContext ctx{.target_name = name, .out_device = &device};
+  g_direct_input->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumDevicesByNameCallback,
+                              &ctx, DIEDFL_ATTACHEDONLY);
+  if (device) {
+    // Set data format and cooperative level.
+    device->SetDataFormat(&c_dfDIJoystick2);
+    device->SetCooperativeLevel(GetDesktopWindow(),
+                                DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
+  }
+  return device;
+}
+
 
 // Polling interval to reduce CPU usage while reading gamepad state.
+  // Try to bind a DirectInput device with matching product name to improve
+  // support for devices like wheels.
+  try {
+    std::wstring wname(name.begin(), name.end());
+    IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
+    if (di_dev) {
+      gamepads[joy_id].di_device = di_dev;
+      gamepads[joy_id].use_directinput = true;
+      std::cout << "Using DirectInput for device " << joy_id << std::endl;
+    }
+  } catch (...) {
+    // Fallback silently if conversion fails.
+  }
 // 8 ms aligns with ~125 Hz update rate typical for many controllers.
 static constexpr int kPollIntervalMs = 8;
 
@@ -76,6 +157,9 @@ bool Gamepads::are_states_different(const JOYINFOEX& a, const JOYINFOEX& b) {
 }
 
 void Gamepads::read_gamepad(Gamepad* gamepad) {
+  // If using DirectInput, set up DI polling state
+  DIJOYSTATE2 di_state{};
+
   JOYINFOEX state;
   state.dwSize = sizeof(JOYINFOEX);
   state.dwFlags = JOY_RETURNALL;
@@ -86,18 +170,68 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
   // Lower thread priority to minimize CPU impact under load.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   // Initial read to seed the state and avoid spurious diffs on first loop.
-  MMRESULT init_result = joyGetPosEx(joy_id, &state);
-  if (init_result != JOYERR_NOERROR) {
-    std::cout << "Fail to initialize gamepad " << joy_id << std::endl;
-    gamepad->alive = false;
-    gamepads.erase(joy_id);
-    return;
+  if (!gamepad->use_directinput) {
+    MMRESULT init_result = joyGetPosEx(joy_id, &state);
+    if (init_result != JOYERR_NOERROR) {
+      std::cout << "Fail to initialize gamepad (WinMM) " << joy_id << std::endl;
+      gamepad->alive = false;
+      gamepads.erase(joy_id);
+      return;
+    }
+  } else {
+    if (gamepad->di_device) {
+      gamepad->di_device->Acquire();
+      HRESULT hr = gamepad->di_device->Poll();
+      if (FAILED(hr)) {
+        gamepad->di_device->Acquire();
+      }
+      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state), &di_state))) {
+        // Seed JOYINFOEX from DIJOYSTATE2 to reuse diff path
+  state.dwXpos = di_axis_to_joy(di_state.lX);
+  state.dwYpos = di_axis_to_joy(di_state.lY);
+  state.dwZpos = di_axis_to_joy(di_state.lZ);
+  state.dwRpos = di_axis_to_joy(di_state.lRz); // wheels often use Rz
+  state.dwUpos = di_axis_to_joy(di_state.lRx);
+  state.dwVpos = di_axis_to_joy(di_state.lRy);
+        // Buttons
+        DWORD buttons = 0;
+        for (int i = 0; i < 32; ++i) {
+          if (di_state.rgbButtons[i] & 0x80) buttons |= (1u << i);
+        }
+        state.dwButtons = buttons;
+        state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+      }
+    }
   }
 
   while (gamepad->alive) {
     JOYINFOEX previous_state = state;
-    MMRESULT result = joyGetPosEx(joy_id, &state);
-    if (result == JOYERR_NOERROR) {
+    bool ok = false;
+    if (!gamepad->use_directinput) {
+      MMRESULT result = joyGetPosEx(joy_id, &state);
+      ok = (result == JOYERR_NOERROR);
+    } else if (gamepad->di_device) {
+      if (FAILED(gamepad->di_device->Poll())) {
+        gamepad->di_device->Acquire();
+      }
+      if (SUCCEEDED(gamepad->di_device->GetDeviceState(sizeof(di_state), &di_state))) {
+        // Map DI to JOYINFOEX fields
+  state.dwXpos = di_axis_to_joy(di_state.lX);
+  state.dwYpos = di_axis_to_joy(di_state.lY);
+  state.dwZpos = di_axis_to_joy(di_state.lZ);
+  state.dwRpos = di_axis_to_joy(di_state.lRz);
+  state.dwUpos = di_axis_to_joy(di_state.lRx);
+  state.dwVpos = di_axis_to_joy(di_state.lRy);
+        DWORD buttons = 0;
+        for (int i = 0; i < 32; ++i) {
+          if (di_state.rgbButtons[i] & 0x80) buttons |= (1u << i);
+        }
+        state.dwButtons = buttons;
+        state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+        ok = true;
+      }
+    }
+    if (ok) {
       if (are_states_different(previous_state, state)) {
         std::list<Event> events = diff_states(gamepad, previous_state, state);
         for (auto joy_event : events) {
@@ -115,6 +249,12 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
 
     // Throttle polling to reduce CPU usage.
     std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+  }
+  // Cleanup DI device if was in use
+  if (gamepad->di_device) {
+    gamepad->di_device->Unacquire();
+    gamepad->di_device->Release();
+    gamepad->di_device = nullptr;
   }
 }
 
@@ -144,8 +284,8 @@ void Gamepads::update_gamepads() {
           connect_gamepad(joy_id, name, num_buttons);
         }
       } else {
-        std::cout << "New gamepad connected " << joy_id << std::endl;
-        connect_gamepad(joy_id, name, num_buttons);
+  std::cout << "New gamepad connected " << joy_id << std::endl;
+  connect_gamepad(joy_id, name, num_buttons);
       }
     }
   }

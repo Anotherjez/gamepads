@@ -5,11 +5,17 @@
 #include <map>
 #include <optional>
 
+// Forward declare to avoid pulling dinput headers here.
+struct IDirectInputDevice8W;
+
 struct Gamepad {
   UINT joy_id;
   std::string name;
   int num_buttons;
   bool alive;
+  // Optional DirectInput device for richer support (e.g., wheels like G923).
+  IDirectInputDevice8W* di_device = nullptr;
+  bool use_directinput = false;
 };
 
 struct Event {
