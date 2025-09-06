@@ -47,7 +47,7 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
                 std::make_unique<flutter::EncodableValue>(*payload));
           }
           delete payload;
-          return 0;
+          return std::optional<LRESULT>(0);
         }
         DEV_BROADCAST_DEVICEINTERFACE filter = {};
         filter.dbcc_size = sizeof(filter);
