@@ -154,7 +154,9 @@ std::list<Event> Gamepads::diff_states(Gamepad* gamepad,
     events.push_back({time, "analog", "pov", static_cast<int>(current.dwPOV)});
   }
   if (old.dwButtons != current.dwButtons) {
-    for (int i = 0; i < gamepad->num_buttons; ++i) {
+  // Scan up to 32 buttons (JOYINFOEX bitfield limit), independent of
+  // WinMM-reported button count, since DirectInput may have more.
+  for (int i = 0; i < 32; ++i) {
       bool was_pressed = old.dwButtons & (1 << i);
       bool is_pressed = current.dwButtons & (1 << i);
       if (was_pressed != is_pressed) {
@@ -215,7 +217,18 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
           if (di_state.rgbButtons[i] & 0x80) buttons |= (1u << i);
         }
         state.dwButtons = buttons;
+        // Map POV[0] to 4 synthetic buttons (up/right/down/left) in high bits
+        // when pressed; keep dwPOV too for analog pov angle if needed.
         state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+        if (di_state.rgdwPOV[0] != 0xFFFFFFFF) {
+          DWORD angle = di_state.rgdwPOV[0] / 100; // degrees
+          auto set_btn = [&](int bit) { state.dwButtons |= (1u << bit); };
+          // Use bits 28..31 for POV
+          if (angle == 0 || angle == 315 || angle == 45) set_btn(28);     // up
+          if (angle == 90 || angle == 45 || angle == 135) set_btn(29);    // right
+          if (angle == 180 || angle == 135 || angle == 225) set_btn(30);  // down
+          if (angle == 270 || angle == 225 || angle == 315) set_btn(31);  // left
+        }
       }
     }
   }
@@ -244,6 +257,14 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
         }
         state.dwButtons = buttons;
         state.dwPOV = (di_state.rgdwPOV[0] == 0xFFFFFFFF) ? 0xFFFF : di_state.rgdwPOV[0];
+        if (di_state.rgdwPOV[0] != 0xFFFFFFFF) {
+          DWORD angle = di_state.rgdwPOV[0] / 100; // degrees
+          auto set_btn = [&](int bit) { state.dwButtons |= (1u << bit); };
+          if (angle == 0 || angle == 315 || angle == 45) set_btn(28);
+          if (angle == 90 || angle == 45 || angle == 135) set_btn(29);
+          if (angle == 180 || angle == 135 || angle == 225) set_btn(30);
+          if (angle == 270 || angle == 225 || angle == 315) set_btn(31);
+        }
         ok = true;
       }
     }
@@ -283,6 +304,14 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
   if (di_dev) {
     gamepads[joy_id].di_device = di_dev;
     gamepads[joy_id].use_directinput = true;
+    // Try to query DI caps to adjust button count if possible.
+    DIDEVCAPS caps;
+    caps.dwSize = sizeof(DIDEVCAPS);
+    if (SUCCEEDED(di_dev->GetCapabilities(&caps))) {
+      gamepads[joy_id].num_buttons = std::min<int>(caps.dwButtons, 32);
+      std::cout << "DI caps: buttons=" << gamepads[joy_id].num_buttons
+                << ", axes=" << caps.dwAxes << std::endl;
+    }
     std::cout << "Using DirectInput for device " << joy_id << std::endl;
   } else {
     std::wcout << L"DirectInput not matched by name; product: "
