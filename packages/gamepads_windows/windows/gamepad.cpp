@@ -59,7 +59,18 @@ struct DiFindContext {
 static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
                                                VOID* ctx) {
   auto* context = reinterpret_cast<DiFindContext*>(ctx);
-  if (context->target_name == inst->tszProductName) {
+  auto target = context->target_name;
+  auto prod = std::wstring(inst->tszProductName);
+  auto instname = std::wstring(inst->tszInstanceName);
+  auto tolower_inplace = [](std::wstring& s) {
+    for (auto& ch : s) ch = static_cast<wchar_t>(towlower(ch));
+  };
+  tolower_inplace(target);
+  tolower_inplace(prod);
+  tolower_inplace(instname);
+  bool match = prod.find(target) != std::wstring::npos ||
+               instname.find(target) != std::wstring::npos;
+  if (match) {
     IDirectInputDevice8W* device = nullptr;
     if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance, &device,
                                                nullptr))) {
@@ -78,6 +89,23 @@ static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
   ctx.out_device = &device;
   g_direct_input->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumDevicesByNameCallback,
                               &ctx, DIEDFL_ATTACHEDONLY);
+  if (!device) {
+    // If not matched by name, just pick the first attached game controller as
+    // a fallback to support wheels misreporting names across APIs.
+    g_direct_input->EnumDevices(
+        DI8DEVCLASS_GAMECTRL,
+        [](const DIDEVICEINSTANCEW* inst, VOID* out) -> BOOL {
+          auto** dev = reinterpret_cast<IDirectInputDevice8W**>(out);
+          if (*dev == nullptr) {
+            if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance,
+                                                       dev, nullptr))) {
+              return DIENUM_STOP;
+            }
+          }
+          return DIENUM_CONTINUE;
+        },
+        &device, DIEDFL_ATTACHEDONLY);
+  }
   if (device) {
     // Set data format and cooperative level.
     device->SetDataFormat(&c_dfDIJoystick2);
@@ -250,12 +278,15 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
   gamepads[joy_id] = {joy_id, name, num_buttons, true};
   // Try to bind a DirectInput device with matching product name to improve
   // support for devices like wheels.
-  std::wstring wname(name.begin(), name.end());
+  std::wstring wname = to_wstring_utf8(name);
   IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
   if (di_dev) {
     gamepads[joy_id].di_device = di_dev;
     gamepads[joy_id].use_directinput = true;
     std::cout << "Using DirectInput for device " << joy_id << std::endl;
+  } else {
+    std::wcout << L"DirectInput not matched by name; product: "
+               << wname << std::endl;
   }
   std::thread read_thread(
       [this, joy_id]() { read_gamepad(&gamepads[joy_id]); });
