@@ -38,6 +38,17 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
   gamepads.update_gamepads();
   window_proc_id = registrar->RegisterTopLevelWindowProcDelegate(
       [this](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        if (!window_handle_) window_handle_ = hwnd;
+        if (message == kMsgGamepadEvent) {
+          auto payload = reinterpret_cast<flutter::EncodableValue*>(lparam);
+          if (channel && payload) {
+            channel->InvokeMethod(
+                "onGamepadEvent",
+                std::make_unique<flutter::EncodableValue>(*payload));
+          }
+          delete payload;
+          return 0;
+        }
         DEV_BROADCAST_DEVICEINTERFACE filter = {};
         filter.dbcc_size = sizeof(filter);
         filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
@@ -75,19 +86,21 @@ void GamepadsWindowsPlugin::HandleMethodCall(
 
 void GamepadsWindowsPlugin::emit_gamepad_event(Gamepad* gamepad,
                                                const Event& event) {
-  auto _channel = this->channel.get();
-  if (_channel) {
-    flutter::EncodableMap map;
-    map[flutter::EncodableValue("gamepadId")] =
-        flutter::EncodableValue(std::to_string(gamepad->joy_id));
-    map[flutter::EncodableValue("time")] = flutter::EncodableValue(event.time);
-    map[flutter::EncodableValue("type")] = flutter::EncodableValue(event.type);
-    map[flutter::EncodableValue("key")] = flutter::EncodableValue(event.key);
-    map[flutter::EncodableValue("value")] =
-        flutter::EncodableValue(static_cast<double>(event.value));
-    _channel->InvokeMethod("onGamepadEvent",
-                           std::make_unique<flutter::EncodableValue>(
-                               flutter::EncodableValue(map)));
+  if (!channel) return;
+  flutter::EncodableMap map;
+  map[flutter::EncodableValue("gamepadId")] =
+      flutter::EncodableValue(std::to_string(gamepad->joy_id));
+  map[flutter::EncodableValue("time")] = flutter::EncodableValue(event.time);
+  map[flutter::EncodableValue("type")] = flutter::EncodableValue(event.type);
+  map[flutter::EncodableValue("key")] = flutter::EncodableValue(event.key);
+  map[flutter::EncodableValue("value")] =
+      flutter::EncodableValue(static_cast<double>(event.value));
+  auto payload = new flutter::EncodableValue(flutter::EncodableValue(map));
+  if (window_handle_) {
+    PostMessage(window_handle_, kMsgGamepadEvent, 0,
+                reinterpret_cast<LPARAM>(payload));
+  } else {
+    delete payload;
   }
 }
 }  // namespace gamepads_windows
