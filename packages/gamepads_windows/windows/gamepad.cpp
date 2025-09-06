@@ -73,7 +73,9 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
 static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
   if (!EnsureDirectInput()) return nullptr;
   IDirectInputDevice8W* device = nullptr;
-  DiFindContext ctx{.target_name = name, .out_device = &device};
+  DiFindContext ctx;
+  ctx.target_name = name;
+  ctx.out_device = &device;
   g_direct_input->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumDevicesByNameCallback,
                               &ctx, DIEDFL_ATTACHEDONLY);
   if (device) {
@@ -85,21 +87,7 @@ static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
   return device;
 }
 
-
 // Polling interval to reduce CPU usage while reading gamepad state.
-  // Try to bind a DirectInput device with matching product name to improve
-  // support for devices like wheels.
-  try {
-    std::wstring wname(name.begin(), name.end());
-    IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
-    if (di_dev) {
-      gamepads[joy_id].di_device = di_dev;
-      gamepads[joy_id].use_directinput = true;
-      std::cout << "Using DirectInput for device " << joy_id << std::endl;
-    }
-  } catch (...) {
-    // Fallback silently if conversion fails.
-  }
 // 8 ms aligns with ~125 Hz update rate typical for many controllers.
 static constexpr int kPollIntervalMs = 8;
 
@@ -260,6 +248,15 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
 
 void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
   gamepads[joy_id] = {joy_id, name, num_buttons, true};
+  // Try to bind a DirectInput device with matching product name to improve
+  // support for devices like wheels.
+  std::wstring wname(name.begin(), name.end());
+  IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
+  if (di_dev) {
+    gamepads[joy_id].di_device = di_dev;
+    gamepads[joy_id].use_directinput = true;
+    std::cout << "Using DirectInput for device " << joy_id << std::endl;
+  }
   std::thread read_thread(
       [this, joy_id]() { read_gamepad(&gamepads[joy_id]); });
   read_thread.detach();
