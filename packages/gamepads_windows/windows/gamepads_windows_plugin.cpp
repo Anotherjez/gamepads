@@ -76,7 +76,7 @@ void GamepadsWindowsPlugin::HandleMethodCall(
       map[flutter::EncodableValue("id")] =
           flutter::EncodableValue(std::to_string(device_id));
       map[flutter::EncodableValue("name")] =
-          flutter::EncodableValue(gamepad.name);
+          flutter::EncodableValue(gamepad ? gamepad->name : std::string(""));
       list.push_back(flutter::EncodableValue(map));
     }
     result->Success(flutter::EncodableValue(list));
