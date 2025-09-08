@@ -62,6 +62,7 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
                                                VOID* ctx) {
   auto* context = reinterpret_cast<DiFindContext*>(ctx);
   auto target = context->target_name;
+
   auto prod = std::wstring(inst->tszProductName);
   auto instname = std::wstring(inst->tszInstanceName);
   auto tolower_inplace = [](std::wstring& s) {
@@ -178,7 +179,7 @@ bool Gamepads::are_states_different(const JOYINFOEX& a, const JOYINFOEX& b) {
          a.dwButtons != b.dwButtons || a.dwPOV != b.dwPOV;
 }
 
-void Gamepads::read_gamepad(Gamepad* gamepad) {
+void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   // If using DirectInput, set up DI polling state
   DIJOYSTATE2 di_state{};
 
@@ -197,7 +198,10 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
     if (init_result != JOYERR_NOERROR) {
       std::cout << "Fail to initialize gamepad (WinMM) " << joy_id << std::endl;
       gamepad->alive = false;
-      gamepads.erase(joy_id);
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        gamepads.erase(joy_id);
+      }
       return;
     }
   } else {
@@ -244,7 +248,7 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
     }
   }
 
-  while (gamepad->alive) {
+  while (gamepad->alive.load()) {
     JOYINFOEX previous_state = state;
     bool ok = false;
     if (!gamepad->use_directinput) {
@@ -288,17 +292,20 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
     }
     if (ok) {
       if (are_states_different(previous_state, state)) {
-        std::list<Event> events = diff_states(gamepad, previous_state, state);
+        std::list<Event> events = diff_states(gamepad.get(), previous_state, state);
         for (auto joy_event : events) {
           if (event_emitter.has_value()) {
-            (*event_emitter)(gamepad, joy_event);
+            (*event_emitter)(gamepad.get(), joy_event);
           }
         }
       }
     } else {
       std::cout << "Fail to listen to gamepad " << joy_id << std::endl;
       gamepad->alive = false;
-      gamepads.erase(joy_id);
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        gamepads.erase(joy_id);
+      }
       break;
     }
 
@@ -314,20 +321,24 @@ void Gamepads::read_gamepad(Gamepad* gamepad) {
 }
 
 void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
-  gamepads[joy_id] = {joy_id, name, num_buttons, true};
+  auto gp = std::make_shared<Gamepad>();
+  gp->joy_id = joy_id;
+  gp->name = name;
+  gp->num_buttons = num_buttons;
+  gp->alive = true;
   // Try to bind a DirectInput device with matching product name to improve
   // support for devices like wheels.
   std::wstring wname = to_wstring_utf8(name);
   IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
   if (di_dev) {
-    gamepads[joy_id].di_device = di_dev;
-    gamepads[joy_id].use_directinput = true;
+    gp->di_device = di_dev;
+    gp->use_directinput = true;
     // Try to query DI caps to adjust button count if possible.
     DIDEVCAPS caps;
     caps.dwSize = sizeof(DIDEVCAPS);
     if (SUCCEEDED(di_dev->GetCapabilities(&caps))) {
-      gamepads[joy_id].num_buttons = std::min<int>(caps.dwButtons, 32);
-      std::cout << "DI caps: buttons=" << gamepads[joy_id].num_buttons
+      gp->num_buttons = std::min<int>(caps.dwButtons, 32);
+      std::cout << "DI caps: buttons=" << gp->num_buttons
                 << ", axes=" << caps.dwAxes << std::endl;
     }
     std::cout << "Using DirectInput for device " << joy_id << std::endl;
@@ -335,9 +346,13 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
     std::wcout << L"DirectInput not matched by name; product: " << wname
                << std::endl;
   }
-  std::thread read_thread(
-      [this, joy_id]() { read_gamepad(&gamepads[joy_id]); });
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    gamepads[joy_id] = gp;
+  }
+  std::thread read_thread([this, gp]() { read_gamepad(gp); });
   read_thread.detach();
+
 }
 
 void Gamepads::update_gamepads() {
@@ -349,17 +364,26 @@ void Gamepads::update_gamepads() {
     if (result == JOYERR_NOERROR) {
       std::string name = to_string(joy_caps.szPname);
       int num_buttons = static_cast<int>(joy_caps.wNumButtons);
-      auto it = gamepads.find(joy_id);
-      if (it != gamepads.end()) {
-        if (it->second.name != name) {
-          std::cout << "Updated gamepad " << joy_id << std::endl;
-          it->second.alive = false;
-          gamepads.erase(it);
-
-          connect_gamepad(joy_id, name, num_buttons);
+      bool need_connect = false;
+      bool was_update = false;
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = gamepads.find(joy_id);
+        if (it != gamepads.end()) {
+          if (it->second->name != name) {
+            std::cout << "Updated gamepad " << joy_id << std::endl;
+            it->second->alive = false;
+            gamepads.erase(it);
+            need_connect = true;
+            was_update = true;
+          }
+        } else {
+          need_connect = true;
         }
-      } else {
-        std::cout << "New gamepad connected " << joy_id << std::endl;
+      }
+      if (need_connect) {
+        if (!was_update)
+          std::cout << "New gamepad connected " << joy_id << std::endl;
         connect_gamepad(joy_id, name, num_buttons);
       }
     }
