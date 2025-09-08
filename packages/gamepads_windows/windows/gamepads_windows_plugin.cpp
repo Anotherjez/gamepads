@@ -38,8 +38,19 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
   gamepads.update_gamepads();
   window_proc_id = registrar->RegisterTopLevelWindowProcDelegate(
       [this](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-        if (!window_handle_)
+        if (!window_handle_) {
           window_handle_ = hwnd;
+          // Register for HID device notifications once, when we first get the
+          // HWND.
+          DEV_BROADCAST_DEVICEINTERFACE filter = {};
+          filter.dbcc_size = sizeof(filter);
+          filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+          filter.dbcc_classguid = GUID_DEVINTERFACE_HID;
+          if (!hDevNotify) {
+            hDevNotify = RegisterDeviceNotification(
+                hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+          }
+        }
         if (message == kMsgGamepadEvent) {
           auto payload = reinterpret_cast<flutter::EncodableValue*>(lparam);
           if (channel && payload) {
@@ -50,19 +61,15 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
           delete payload;
           return std::optional<LRESULT>(0);
         }
-        DEV_BROADCAST_DEVICEINTERFACE filter = {};
-        filter.dbcc_size = sizeof(filter);
-        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-        filter.dbcc_classguid = GUID_DEVINTERFACE_HID;
-        this->hDevNotify = RegisterDeviceNotification(
-            hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
-
         return GamepadListenerProc(hwnd, message, wparam, lparam);
       });
 }
 
 GamepadsWindowsPlugin::~GamepadsWindowsPlugin() {
-  UnregisterDeviceNotification(hDevNotify);
+  if (hDevNotify) {
+    UnregisterDeviceNotification(hDevNotify);
+    hDevNotify = nullptr;
+  }
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
 }
 
@@ -71,13 +78,18 @@ void GamepadsWindowsPlugin::HandleMethodCall(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (method_call.method_name().compare("listGamepads") == 0) {
     flutter::EncodableList list;
-    for (auto [device_id, gamepad] : gamepads.gamepads) {
-      flutter::EncodableMap map;
-      map[flutter::EncodableValue("id")] =
-          flutter::EncodableValue(std::to_string(device_id));
-      map[flutter::EncodableValue("name")] =
-          flutter::EncodableValue(gamepad ? gamepad->name : std::string(""));
-      list.push_back(flutter::EncodableValue(map));
+    {
+      std::lock_guard<std::mutex> lock(gamepads.mtx);
+      for (auto const& kv : gamepads.gamepads) {
+        const auto device_id = kv.first;
+        const auto& gamepad = kv.second;
+        flutter::EncodableMap map;
+        map[flutter::EncodableValue("id")] =
+            flutter::EncodableValue(std::to_string(device_id));
+        map[flutter::EncodableValue("name")] =
+            flutter::EncodableValue(gamepad ? gamepad->name : std::string(""));
+        list.push_back(flutter::EncodableValue(map));
+      }
     }
     result->Success(flutter::EncodableValue(list));
   } else {

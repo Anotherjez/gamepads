@@ -292,7 +292,8 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
     }
     if (ok) {
       if (are_states_different(previous_state, state)) {
-        std::list<Event> events = diff_states(gamepad.get(), previous_state, state);
+        std::list<Event> events =
+            diff_states(gamepad.get(), previous_state, state);
         for (auto joy_event : events) {
           if (event_emitter.has_value()) {
             (*event_emitter)(gamepad.get(), joy_event);
@@ -314,7 +315,9 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   }
   // Cleanup DI device if was in use
   if (gamepad->di_device) {
-    gamepad->di_device->Unacquire();
+    // Defensive cleanup in case the device was unplugged.
+    HRESULT hr = gamepad->di_device->Unacquire();
+    (void)hr;
     gamepad->di_device->Release();
     gamepad->di_device = nullptr;
   }
@@ -352,7 +355,6 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
   }
   std::thread read_thread([this, gp]() { read_gamepad(gp); });
   read_thread.detach();
-
 }
 
 void Gamepads::update_gamepads() {
