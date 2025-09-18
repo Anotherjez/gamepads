@@ -36,13 +36,17 @@ class Gamepads {
   bool are_states_different(const JOYINFOEX& a, const JOYINFOEX& b);
   void read_gamepad(std::shared_ptr<Gamepad> gamepad);
   void connect_gamepad(UINT joy_id, std::string name, int num_buttons);
+  // Prevent overlapping update runs and coalesce rapid device-change events.
+  std::atomic<bool> update_scheduled{false};
 
  public:
   std::map<UINT, std::shared_ptr<Gamepad>> gamepads;
   std::mutex mtx;
+  std::mutex update_mtx;
   std::optional<std::function<void(Gamepad* gamepad, const Event& event)>>
       event_emitter;
   void update_gamepads();
+  void request_update();
 };
 
 extern Gamepads gamepads;

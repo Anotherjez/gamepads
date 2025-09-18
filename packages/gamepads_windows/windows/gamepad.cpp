@@ -28,6 +28,7 @@
 Gamepads gamepads;
 // -------------------- DirectInput helpers --------------------
 static IDirectInput8W* g_direct_input = nullptr;
+static std::mutex g_di_mutex;  // serialize DI create/enum/destroy
 static inline DWORD di_axis_to_joy(LONG v) {
   // DI axes are typically -32768..32767; convert to 0..65535
   long shifted = static_cast<long>(v) + 32768L;
@@ -39,6 +40,7 @@ static inline DWORD di_axis_to_joy(LONG v) {
 }
 
 static bool EnsureDirectInput() {
+  std::lock_guard<std::mutex> lock(g_di_mutex);
   if (g_direct_input)
     return true;
   HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -88,6 +90,7 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
 static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
   if (!EnsureDirectInput())
     return nullptr;
+  std::lock_guard<std::mutex> lock(g_di_mutex);
   IDirectInputDevice8W* device = nullptr;
   DiFindContext ctx;
   ctx.target_name = name;
@@ -316,10 +319,13 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   // Cleanup DI device if was in use
   if (gamepad->di_device) {
     // Defensive cleanup in case the device was unplugged.
-    HRESULT hr = gamepad->di_device->Unacquire();
-    (void)hr;
-    gamepad->di_device->Release();
-    gamepad->di_device = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_di_mutex);
+      HRESULT hr = gamepad->di_device->Unacquire();
+      (void)hr;
+      gamepad->di_device->Release();
+      gamepad->di_device = nullptr;
+    }
   }
 }
 
@@ -358,6 +364,13 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
 }
 
 void Gamepads::update_gamepads() {
+  // Coalesce rapid calls; serialize the scan entire sequence.
+  std::unique_lock<std::mutex> lk(update_mtx, std::try_to_lock);
+  if (!lk.owns_lock()) {
+    update_scheduled.store(true, std::memory_order_relaxed);
+    return;
+  }
+  update_scheduled.store(false, std::memory_order_relaxed);
   std::cout << "Updating gamepads..." << std::endl;
   UINT max_joysticks = joyGetNumDevs();
   JOYCAPSW joy_caps;
@@ -390,6 +403,11 @@ void Gamepads::update_gamepads() {
       }
     }
   }
+  // If updates piled up, run one more pass.
+  if (update_scheduled.exchange(false, std::memory_order_relaxed)) {
+    lk.unlock();
+    update_gamepads();
+  }
 }
 
 std::set<std::wstring> connected_devices;
@@ -412,10 +430,10 @@ std::optional<LRESULT> CALLBACK GamepadListenerProc(HWND hwnd,
                 connected_devices.find(device_path) != connected_devices.end();
             if (!is_connected && wParam == DBT_DEVICEARRIVAL) {
               connected_devices.insert(device_path);
-              gamepads.update_gamepads();
+              gamepads.request_update();
             } else if (is_connected && wParam == DBT_DEVICEREMOVECOMPLETE) {
               connected_devices.erase(device_path);
-              gamepads.update_gamepads();
+              gamepads.request_update();
             }
           }
         }
@@ -428,4 +446,19 @@ std::optional<LRESULT> CALLBACK GamepadListenerProc(HWND hwnd,
     }
   }
   return std::nullopt;
+}
+
+// Debounced request to update gamepads; schedules update on first call or
+// coalesces multiple rapid requests to a single scan.
+void Gamepads::request_update() {
+  // Simple debounce: post a small delayed update on a separate thread, but
+  // coalesce if many calls come in quickly.
+  bool expected = false;
+  if (update_scheduled.compare_exchange_strong(expected, true,
+                                               std::memory_order_relaxed)) {
+    std::thread([this]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      update_gamepads();
+    }).detach();
+  }
 }
