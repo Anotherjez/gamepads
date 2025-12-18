@@ -38,6 +38,7 @@ class Gamepads {
   void connect_gamepad(UINT joy_id, std::string name, int num_buttons);
   // Prevent overlapping update runs and coalesce rapid device-change events.
   std::atomic<bool> update_scheduled{false};
+  std::atomic<bool> shutting_down{false};
 
  public:
   std::map<UINT, std::shared_ptr<Gamepad>> gamepads;
@@ -47,6 +48,10 @@ class Gamepads {
       event_emitter;
   void update_gamepads();
   void request_update();
+
+  // Stops background polling threads and prevents further device updates.
+  // Safe to call multiple times.
+  void shutdown();
 };
 
 extern Gamepads gamepads;

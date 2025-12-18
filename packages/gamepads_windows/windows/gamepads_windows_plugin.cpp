@@ -66,6 +66,12 @@ GamepadsWindowsPlugin::GamepadsWindowsPlugin(
 }
 
 GamepadsWindowsPlugin::~GamepadsWindowsPlugin() {
+  // Ensure background polling threads stop and won't call into this instance.
+  gamepads.shutdown();
+
+  // Drop the shared channel reference early to prevent late InvokeMethod calls.
+  channel.reset();
+
   if (hDevNotify) {
     UnregisterDeviceNotification(hDevNotify);
     hDevNotify = nullptr;

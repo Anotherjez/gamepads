@@ -251,7 +251,7 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
     }
   }
 
-  while (gamepad->alive.load()) {
+  while (gamepad->alive.load() && !shutting_down.load(std::memory_order_relaxed)) {
     JOYINFOEX previous_state = state;
     bool ok = false;
     if (!gamepad->use_directinput) {
@@ -364,6 +364,8 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
 }
 
 void Gamepads::update_gamepads() {
+  if (shutting_down.load(std::memory_order_relaxed))
+    return;
   // Coalesce rapid calls; serialize the scan entire sequence.
   std::unique_lock<std::mutex> lk(update_mtx, std::try_to_lock);
   if (!lk.owns_lock()) {
@@ -375,6 +377,8 @@ void Gamepads::update_gamepads() {
   UINT max_joysticks = joyGetNumDevs();
   JOYCAPSW joy_caps;
   for (UINT joy_id = 0; joy_id < max_joysticks; ++joy_id) {
+    if (shutting_down.load(std::memory_order_relaxed))
+      break;
     MMRESULT result = joyGetDevCapsW(joy_id, &joy_caps, sizeof(JOYCAPSW));
     if (result == JOYERR_NOERROR) {
       std::string name = to_string(joy_caps.szPname);
@@ -404,7 +408,8 @@ void Gamepads::update_gamepads() {
     }
   }
   // If updates piled up, run one more pass.
-  if (update_scheduled.exchange(false, std::memory_order_relaxed)) {
+  if (!shutting_down.load(std::memory_order_relaxed) &&
+      update_scheduled.exchange(false, std::memory_order_relaxed)) {
     lk.unlock();
     update_gamepads();
   }
@@ -451,6 +456,8 @@ std::optional<LRESULT> CALLBACK GamepadListenerProc(HWND hwnd,
 // Debounced request to update gamepads; schedules update on first call or
 // coalesces multiple rapid requests to a single scan.
 void Gamepads::request_update() {
+  if (shutting_down.load(std::memory_order_relaxed))
+    return;
   // Simple debounce: post a small delayed update on a separate thread, but
   // coalesce if many calls come in quickly.
   bool expected = false;
@@ -460,5 +467,24 @@ void Gamepads::request_update() {
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
       update_gamepads();
     }).detach();
+  }
+}
+
+void Gamepads::shutdown() {
+  // Mark shutdown first so any racing request_update/update_gamepads returns.
+  bool already = shutting_down.exchange(true, std::memory_order_relaxed);
+  (void)already;
+
+  // Stop emitting events immediately to avoid calling into a disposed plugin.
+  event_emitter.reset();
+
+  // Mark all current gamepads as dead and clear the registry.
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto& kv : gamepads) {
+      if (kv.second)
+        kv.second->alive.store(false, std::memory_order_relaxed);
+    }
+    gamepads.clear();
   }
 }
