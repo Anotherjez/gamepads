@@ -28,7 +28,15 @@
 Gamepads gamepads;
 // -------------------- DirectInput helpers --------------------
 static IDirectInput8W* g_direct_input = nullptr;
-static std::mutex g_di_mutex;  // serialize DI create/enum/destroy
+// Serializes every WinMM joystick and DirectInput call. Neither API is safe to
+// enter from several threads while Windows re-enumerates devices after a USB
+// change; concurrent rescans and reader polls corrupted the process heap
+// (0xC0000374 / 0xC0000005). Recursive because a rescan creates DI devices.
+static std::recursive_mutex g_input_api_mutex;
+using InputApiLock = std::lock_guard<std::recursive_mutex>;
+// Timer used to debounce device-change rescans onto the window thread.
+static constexpr UINT_PTR kRescanTimerId = 0x6A70;
+static constexpr UINT kRescanDebounceMs = 150;
 static inline DWORD di_axis_to_joy(LONG v) {
   // DI axes are typically -32768..32767; convert to 0..65535
   long shifted = static_cast<long>(v) + 32768L;
@@ -40,7 +48,7 @@ static inline DWORD di_axis_to_joy(LONG v) {
 }
 
 static bool EnsureDirectInput() {
-  std::lock_guard<std::mutex> lock(g_di_mutex);
+  InputApiLock lock(g_input_api_mutex);
   if (g_direct_input)
     return true;
   HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -90,7 +98,7 @@ static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
 static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
   if (!EnsureDirectInput())
     return nullptr;
-  std::lock_guard<std::mutex> lock(g_di_mutex);
+  InputApiLock lock(g_input_api_mutex);
   IDirectInputDevice8W* device = nullptr;
   DiFindContext ctx;
   ctx.target_name = name;
@@ -197,18 +205,20 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   // Initial read to seed the state and avoid spurious diffs on first loop.
   if (!gamepad->use_directinput) {
-    MMRESULT init_result = joyGetPosEx(joy_id, &state);
+    MMRESULT init_result;
+    {
+      InputApiLock api_lock(g_input_api_mutex);
+      init_result = joyGetPosEx(joy_id, &state);
+    }
     if (init_result != JOYERR_NOERROR) {
       std::cout << "Fail to initialize gamepad (WinMM) " << joy_id << std::endl;
       gamepad->alive = false;
-      {
-        std::lock_guard<std::mutex> lock(mtx);
-        gamepads.erase(joy_id);
-      }
+      forget(gamepad);
       return;
     }
   } else {
     if (gamepad->di_device) {
+      InputApiLock api_lock(g_input_api_mutex);
       gamepad->di_device->Acquire();
       HRESULT hr = gamepad->di_device->Poll();
       if (FAILED(hr)) {
@@ -255,9 +265,11 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
     JOYINFOEX previous_state = state;
     bool ok = false;
     if (!gamepad->use_directinput) {
+      InputApiLock api_lock(g_input_api_mutex);
       MMRESULT result = joyGetPosEx(joy_id, &state);
       ok = (result == JOYERR_NOERROR);
     } else if (gamepad->di_device) {
+      InputApiLock api_lock(g_input_api_mutex);
       if (FAILED(gamepad->di_device->Poll())) {
         gamepad->di_device->Acquire();
       }
@@ -306,10 +318,7 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
     } else {
       std::cout << "Fail to listen to gamepad " << joy_id << std::endl;
       gamepad->alive = false;
-      {
-        std::lock_guard<std::mutex> lock(mtx);
-        gamepads.erase(joy_id);
-      }
+      forget(gamepad);
       break;
     }
 
@@ -320,7 +329,7 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   if (gamepad->di_device) {
     // Defensive cleanup in case the device was unplugged.
     {
-      std::lock_guard<std::mutex> lock(g_di_mutex);
+      InputApiLock lock(g_input_api_mutex);
       HRESULT hr = gamepad->di_device->Unacquire();
       (void)hr;
       gamepad->di_device->Release();
@@ -345,7 +354,12 @@ void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
     // Try to query DI caps to adjust button count if possible.
     DIDEVCAPS caps;
     caps.dwSize = sizeof(DIDEVCAPS);
-    if (SUCCEEDED(di_dev->GetCapabilities(&caps))) {
+    HRESULT caps_result;
+    {
+      InputApiLock api_lock(g_input_api_mutex);
+      caps_result = di_dev->GetCapabilities(&caps);
+    }
+    if (SUCCEEDED(caps_result)) {
       gp->num_buttons = std::min<int>(caps.dwButtons, 32);
       std::cout << "DI caps: buttons=" << gp->num_buttons
                 << ", axes=" << caps.dwAxes << std::endl;
@@ -374,12 +388,20 @@ void Gamepads::update_gamepads() {
   }
   update_scheduled.store(false, std::memory_order_relaxed);
   std::cout << "Updating gamepads..." << std::endl;
-  UINT max_joysticks = joyGetNumDevs();
+  UINT max_joysticks;
+  {
+    InputApiLock api_lock(g_input_api_mutex);
+    max_joysticks = joyGetNumDevs();
+  }
   JOYCAPSW joy_caps;
   for (UINT joy_id = 0; joy_id < max_joysticks; ++joy_id) {
     if (shutting_down.load(std::memory_order_relaxed))
       break;
-    MMRESULT result = joyGetDevCapsW(joy_id, &joy_caps, sizeof(JOYCAPSW));
+    MMRESULT result;
+    {
+      InputApiLock api_lock(g_input_api_mutex);
+      result = joyGetDevCapsW(joy_id, &joy_caps, sizeof(JOYCAPSW));
+    }
     if (result == JOYERR_NOERROR) {
       std::string name = to_string(joy_caps.szPname);
       int num_buttons = static_cast<int>(joy_caps.wNumButtons);
@@ -415,13 +437,38 @@ void Gamepads::update_gamepads() {
   }
 }
 
+void Gamepads::forget(const std::shared_ptr<Gamepad>& gamepad) {
+  // A rescan may already have replaced this joy_id with a new reader; only
+  // remove the entry this reader owns.
+  std::lock_guard<std::mutex> lock(mtx);
+  auto it = gamepads.find(gamepad->joy_id);
+  if (it != gamepads.end() && it->second == gamepad)
+    gamepads.erase(it);
+}
+
 std::set<std::wstring> connected_devices;
+
+// Debounces device-change rescans onto the window thread: every HID change
+// restarts the timer, and WM_TIMER runs a single rescan. Without a window
+// (tests), falls back to the detached debounce.
+static void schedule_rescan(HWND hwnd) {
+  if (hwnd && SetTimer(hwnd, kRescanTimerId, kRescanDebounceMs, nullptr))
+    return;
+  gamepads.request_update();
+}
 
 std::optional<LRESULT> CALLBACK GamepadListenerProc(HWND hwnd,
                                                     UINT uMsg,
                                                     WPARAM wParam,
                                                     LPARAM lParam) {
   switch (uMsg) {
+    case WM_TIMER: {
+      if (wParam != kRescanTimerId)
+        return std::nullopt;
+      KillTimer(hwnd, kRescanTimerId);
+      gamepads.update_gamepads();
+      return 0;
+    }
     case WM_DEVICECHANGE: {
       if (lParam != NULL) {
         PDEV_BROADCAST_HDR pHdr = (PDEV_BROADCAST_HDR)lParam;
@@ -435,10 +482,10 @@ std::optional<LRESULT> CALLBACK GamepadListenerProc(HWND hwnd,
                 connected_devices.find(device_path) != connected_devices.end();
             if (!is_connected && wParam == DBT_DEVICEARRIVAL) {
               connected_devices.insert(device_path);
-              gamepads.request_update();
+              schedule_rescan(hwnd);
             } else if (is_connected && wParam == DBT_DEVICEREMOVECOMPLETE) {
               connected_devices.erase(device_path);
-              gamepads.request_update();
+              schedule_rescan(hwnd);
             }
           }
         }
