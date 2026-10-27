@@ -35,7 +35,7 @@ class Gamepads {
                                const JOYINFOEX& current);
   bool are_states_different(const JOYINFOEX& a, const JOYINFOEX& b);
   void read_gamepad(std::shared_ptr<Gamepad> gamepad);
-  void connect_gamepad(UINT joy_id, std::string name, int num_buttons);
+  void connect_gamepad(UINT joy_id, std::string name, const GUID& guid);
   // Removes gamepad's map entry only if a rescan has not replaced it.
   void forget(const std::shared_ptr<Gamepad>& gamepad);
   // Prevent overlapping update runs and coalesce rapid device-change events.

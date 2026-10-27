@@ -11,6 +11,8 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <vector>
+#include <objbase.h>
 #include <chrono>
 #include <algorithm>
 
@@ -63,72 +65,58 @@ static bool EnsureDirectInput() {
   return true;
 }
 
-struct DiFindContext {
-  std::wstring target_name;
-  IDirectInputDevice8W** out_device;
+struct DiDeviceInfo {
+  GUID guid;
+  std::wstring product;
 };
 
-static BOOL CALLBACK EnumDevicesByNameCallback(const DIDEVICEINSTANCEW* inst,
-                                               VOID* ctx) {
-  auto* context = reinterpret_cast<DiFindContext*>(ctx);
-  auto target = context->target_name;
-
-  auto prod = std::wstring(inst->tszProductName);
-  auto instname = std::wstring(inst->tszInstanceName);
-  auto tolower_inplace = [](std::wstring& s) {
-    for (auto& ch : s)
-      ch = static_cast<wchar_t>(towlower(ch));
-  };
-  tolower_inplace(target);
-  tolower_inplace(prod);
-  tolower_inplace(instname);
-  bool match = prod.find(target) != std::wstring::npos ||
-               instname.find(target) != std::wstring::npos;
-  if (match) {
-    IDirectInputDevice8W* device = nullptr;
-    if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance, &device,
-                                               nullptr))) {
-      *context->out_device = device;
-      return DIENUM_STOP;
-    }
-  }
+static BOOL CALLBACK CollectGameControllers(const DIDEVICEINSTANCEW* inst,
+                                            VOID* ctx) {
+  auto* out = reinterpret_cast<std::vector<DiDeviceInfo>*>(ctx);
+  out->push_back({inst->guidInstance, inst->tszProductName});
   return DIENUM_CONTINUE;
 }
 
-static IDirectInputDevice8W* CreateDIDeviceForName(const std::wstring& name) {
+// Lists attached game controllers through DirectInput. WinMM joystick
+// enumeration (joyGetNumDevs/joyGetDevCapsW) during a USB change corrupted
+// the process heap even when serialized, so rescans no longer use WinMM.
+static std::vector<DiDeviceInfo> EnumerateGameControllers() {
+  std::vector<DiDeviceInfo> devices;
+  if (!EnsureDirectInput())
+    return devices;
+  InputApiLock lock(g_input_api_mutex);
+  g_direct_input->EnumDevices(DI8DEVCLASS_GAMECTRL, CollectGameControllers,
+                              &devices, DIEDFL_ATTACHEDONLY);
+  return devices;
+}
+
+static IDirectInputDevice8W* CreateDIDeviceForGuid(const GUID& guid) {
   if (!EnsureDirectInput())
     return nullptr;
   InputApiLock lock(g_input_api_mutex);
   IDirectInputDevice8W* device = nullptr;
-  DiFindContext ctx;
-  ctx.target_name = name;
-  ctx.out_device = &device;
-  g_direct_input->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumDevicesByNameCallback,
-                              &ctx, DIEDFL_ATTACHEDONLY);
-  if (!device) {
-    // If not matched by name, just pick the first attached game controller as
-    // a fallback to support wheels misreporting names across APIs.
-    g_direct_input->EnumDevices(
-        DI8DEVCLASS_GAMECTRL,
-        [](const DIDEVICEINSTANCEW* inst, VOID* out) -> BOOL {
-          auto** dev = reinterpret_cast<IDirectInputDevice8W**>(out);
-          if (*dev == nullptr) {
-            if (SUCCEEDED(g_direct_input->CreateDevice(inst->guidInstance, dev,
-                                                       nullptr))) {
-              return DIENUM_STOP;
-            }
-          }
-          return DIENUM_CONTINUE;
-        },
-        &device, DIEDFL_ATTACHEDONLY);
-  }
-  if (device) {
-    // Set data format and cooperative level.
-    device->SetDataFormat(&c_dfDIJoystick2);
-    device->SetCooperativeLevel(GetDesktopWindow(),
-                                DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
-  }
+  if (FAILED(g_direct_input->CreateDevice(guid, &device, nullptr)))
+    return nullptr;
+  device->SetDataFormat(&c_dfDIJoystick2);
+  device->SetCooperativeLevel(GetDesktopWindow(),
+                              DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
   return device;
+}
+
+// Stable per-session ids: the same DirectInput instance keeps its id across
+// unplug/replug, and the Dart side keeps seeing it as the same gamepad.
+static std::map<std::wstring, UINT> g_device_ids;
+static UINT g_next_device_id = 0;
+
+static UINT DeviceIdFor(const GUID& guid) {
+  wchar_t text[64] = {};
+  StringFromGUID2(guid, text, 64);
+  auto it = g_device_ids.find(text);
+  if (it != g_device_ids.end())
+    return it->second;
+  UINT id = g_next_device_id++;
+  g_device_ids.emplace(text, id);
+  return id;
 }
 
 // Polling interval to reduce CPU usage while reading gamepad state.
@@ -338,36 +326,31 @@ void Gamepads::read_gamepad(std::shared_ptr<Gamepad> gamepad) {
   }
 }
 
-void Gamepads::connect_gamepad(UINT joy_id, std::string name, int num_buttons) {
+void Gamepads::connect_gamepad(UINT joy_id, std::string name, const GUID& guid) {
+  IDirectInputDevice8W* di_dev = CreateDIDeviceForGuid(guid);
+  if (!di_dev) {
+    std::cout << "DirectInput device unavailable for gamepad " << joy_id
+              << std::endl;
+    return;
+  }
   auto gp = std::make_shared<Gamepad>();
   gp->joy_id = joy_id;
   gp->name = name;
-  gp->num_buttons = num_buttons;
+  gp->num_buttons = 32;
   gp->alive = true;
-  // Try to bind a DirectInput device with matching product name to improve
-  // support for devices like wheels.
-  std::wstring wname = to_wstring_utf8(name);
-  IDirectInputDevice8W* di_dev = CreateDIDeviceForName(wname);
-  if (di_dev) {
-    gp->di_device = di_dev;
-    gp->use_directinput = true;
-    // Try to query DI caps to adjust button count if possible.
-    DIDEVCAPS caps;
-    caps.dwSize = sizeof(DIDEVCAPS);
-    HRESULT caps_result;
-    {
-      InputApiLock api_lock(g_input_api_mutex);
-      caps_result = di_dev->GetCapabilities(&caps);
-    }
-    if (SUCCEEDED(caps_result)) {
-      gp->num_buttons = std::min<int>(caps.dwButtons, 32);
-      std::cout << "DI caps: buttons=" << gp->num_buttons
-                << ", axes=" << caps.dwAxes << std::endl;
-    }
-    std::cout << "Using DirectInput for device " << joy_id << std::endl;
-  } else {
-    std::wcout << L"DirectInput not matched by name; product: " << wname
-               << std::endl;
+  gp->di_device = di_dev;
+  gp->use_directinput = true;
+  DIDEVCAPS caps;
+  caps.dwSize = sizeof(DIDEVCAPS);
+  HRESULT caps_result;
+  {
+    InputApiLock api_lock(g_input_api_mutex);
+    caps_result = di_dev->GetCapabilities(&caps);
+  }
+  if (SUCCEEDED(caps_result)) {
+    gp->num_buttons = std::min<int>(caps.dwButtons, 32);
+    std::cout << "DI caps: buttons=" << gp->num_buttons
+              << ", axes=" << caps.dwAxes << std::endl;
   }
   {
     std::lock_guard<std::mutex> lock(mtx);
@@ -388,44 +371,34 @@ void Gamepads::update_gamepads() {
   }
   update_scheduled.store(false, std::memory_order_relaxed);
   std::cout << "Updating gamepads..." << std::endl;
-  UINT max_joysticks;
-  {
-    InputApiLock api_lock(g_input_api_mutex);
-    max_joysticks = joyGetNumDevs();
-  }
-  JOYCAPSW joy_caps;
-  for (UINT joy_id = 0; joy_id < max_joysticks; ++joy_id) {
+  std::vector<DiDeviceInfo> devices = EnumerateGameControllers();
+  std::set<UINT> present;
+  for (const DiDeviceInfo& device : devices) {
     if (shutting_down.load(std::memory_order_relaxed))
       break;
-    MMRESULT result;
+    UINT joy_id = DeviceIdFor(device.guid);
+    present.insert(joy_id);
+    bool need_connect;
     {
-      InputApiLock api_lock(g_input_api_mutex);
-      result = joyGetDevCapsW(joy_id, &joy_caps, sizeof(JOYCAPSW));
+      std::lock_guard<std::mutex> lock(mtx);
+      need_connect = gamepads.find(joy_id) == gamepads.end();
     }
-    if (result == JOYERR_NOERROR) {
-      std::string name = to_string(joy_caps.szPname);
-      int num_buttons = static_cast<int>(joy_caps.wNumButtons);
-      bool need_connect = false;
-      bool was_update = false;
-      {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = gamepads.find(joy_id);
-        if (it != gamepads.end()) {
-          if (it->second->name != name) {
-            std::cout << "Updated gamepad " << joy_id << std::endl;
-            it->second->alive = false;
-            gamepads.erase(it);
-            need_connect = true;
-            was_update = true;
-          }
-        } else {
-          need_connect = true;
-        }
-      }
-      if (need_connect) {
-        if (!was_update)
-          std::cout << "New gamepad connected " << joy_id << std::endl;
-        connect_gamepad(joy_id, name, num_buttons);
+    if (need_connect) {
+      std::cout << "New gamepad connected " << joy_id << std::endl;
+      connect_gamepad(joy_id, to_string(device.product), device.guid);
+    }
+  }
+  // Readers of detached devices also stop on their own when DirectInput
+  // reports the device lost; this drops them even if they are idle.
+  if (!shutting_down.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto it = gamepads.begin(); it != gamepads.end();) {
+      if (present.count(it->first) == 0) {
+        std::cout << "Gamepad disconnected " << it->first << std::endl;
+        it->second->alive = false;
+        it = gamepads.erase(it);
+      } else {
+        ++it;
       }
     }
   }
